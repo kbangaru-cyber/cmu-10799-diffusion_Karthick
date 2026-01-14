@@ -20,7 +20,7 @@ cmu-10799-diffusion/
 
 **TODOs in this directory:**
 1. train.py: incorporate your sampling scheme to the training pipeline and save generated samples as images for logging
-2. sample.py: incorporate your sampling scheme to the training pipeline and save generated samples as images for logging
+2. sample.py: incorporate your sampling scheme to the training pipeline and save generated samples as images
 
 ## Subdirectories
 
