@@ -63,7 +63,7 @@ cmu-10799-diffusion/
 3. src/models/unet.py: implement the unet model architecture and its forward pass
 4. configs/: create your own model configs
 5. train.py: incorporate your sampling scheme to the training pipeline and save generated samples as images for logging
-6. sample.py: incorporate your sampling scheme to the training pipeline and save generated samples as images for logging
+6. sample.py: incorporate your sampling scheme to the training pipeline and save generated samples as images
 
 ## Example scripts & Helper skeleton notebooks
 Besides the parts that you need to implement, the starter code also provides several example scripts & helper notebook skeleton to help you get started.
@@ -250,3 +250,10 @@ modal secret create wandb-api-key WANDB_API_KEY=your_real_key
 ## Configuration
 
 All hyperparameters are controlled via config files. Edit `configs/ddpm*.yaml` to configurate your model.
+
+---
+
+
+## Authors
+
+This repository is created by Yutong (Kelly) He, Claude Code and OpenAI Codex.
