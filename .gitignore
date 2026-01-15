@@ -58,3 +58,6 @@ fid_stats/
 tmp/
 temp/
 *.tmp
+
+# AI files
+.claude/

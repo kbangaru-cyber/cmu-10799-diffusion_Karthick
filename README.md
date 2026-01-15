@@ -4,6 +4,8 @@ Welcome to CMU 10799 Spring 2026: Diffusion & Flow Matching!
 
 This repository contains your starter code for all four homework assignments. You'll build a working diffusion model from scratch, starting with DDPM fundamentals and progressing through flow matching to your chosen specialization track. The codebase is designed to grow with you, and what you implement in HW1 becomes the foundation for everything that follows.
 
+[[Class Website](https://kellyyutonghe.github.io/10799S26/)] | [[Homework Handouts](https://kellyyutonghe.github.io/10799S26/homework/)]
+
 ## Project Structure
 
 ```
@@ -256,4 +258,8 @@ All hyperparameters are controlled via config files. Edit `configs/ddpm*.yaml` t
 
 ## Authors
 
-This repository is created by Yutong (Kelly) He, Claude Code and OpenAI Codex.
+Yutong (Kelly) He, with assistance from Claude Code and OpenAI Codex.
+
+## References
+
+- [DDIM official code](https://github.com/ermongroup/ddim/)
