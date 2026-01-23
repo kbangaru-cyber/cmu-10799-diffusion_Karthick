@@ -69,6 +69,26 @@ class DDPM(BaseMethod):
             torch.sqrt(alphas) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar),
         )
 
+    @classmethod
+    def from_config(cls, model, config, device):
+        # configs sometimes nest ddpm params under "ddpm"
+        ddpm_cfg = config.get("ddpm", config)
+
+        num_timesteps = int(ddpm_cfg.get("num_timesteps", 1000))
+        beta_start = float(ddpm_cfg.get("beta_start", 1e-4))
+        beta_end = float(ddpm_cfg.get("beta_end", 2e-2))
+
+        method = cls(
+            model=model,
+            device=device,
+            num_timesteps=num_timesteps,
+            beta_start=beta_start,
+            beta_end=beta_end,
+        )
+        # make sure buffers + model are on the right device
+        return method.to(device)
+
+    
     @staticmethod
     def _extract(a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tensor:
         """
