@@ -1,63 +1,50 @@
 data:
-  dataset: "celeba"
-  root: "/data/celeba"
-  from_hub: true  # run "modal run modal_app.py --action download" first, huggingface will use the arrow files that you pre-download afterwards
-  repo_name: "electronickale/cmu-10799-celeba64-subset"
+  dataset: celeba
   image_size: 64
-  channels: 3
   num_workers: 4
   pin_memory: true
-  augment: true
-
-# TODO: build your model architecture, feel free to add or exclude any of these options
+  cache_dir: /data/celeba
+  hf_repo: electronickale/cmu-10799-celeba64-subset
 model:
-  base_channels: # int
-  channel_mult: # list of int [1, 2, 2, 4]
-  num_res_blocks: # TODO
-  attention_resolutions: # list of int
-  num_heads: # int
-  dropout: # float
-  use_scale_shift_norm: # bool
-
-# TODO: your training hyperparameters, feel free to add or exclude any of these options
-training:
-  batch_size: # int
-  learning_rate: # float
-  weight_decay: # float
-  betas: # list of float
-  ema_decay: # float
-  ema_start: # int # This is the start iter to use EMA during sampling at training time, as using EMA at the beginning may not be very meaningful
-  gradient_clip_norm: # float
-  num_iterations: # int
-  log_every: # int
-  sample_every: # int
-  save_every: # int
-  num_samples: # int
-
-# TODO: your ddpm algorithm hyperparameters, feel free to add or exclude any of these options
+  in_channels: 3
+  out_channels: 3
+  base_channels: 128
+  channel_mult:
+  - 1
+  - 2
+  - 2
+  - 4
+  num_res_blocks: 2
+  attention_resolutions:
+  - 16
+  - 8
+  num_heads: 4
+  dropout: 0.1
+  use_scale_shift_norm: true
 ddpm:
-  num_timesteps: # int
-  beta_start: # float
-  beta_end: # float
-
+  num_timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+training:
+  batch_size: 64
+  num_iterations: 2000
+  lr: 0.0002
+  weight_decay: 0.0
+  gradient_clip_norm: 1.0
+  log_every: 50
+  sample_every: 200
+  checkpoint_every: 1000
+  ema_decay: 0.9999
+  ema_start: 0
 sampling:
-  num_steps: # int
-  sampler: "ddpm" # for the first hw we only need ddpm sampling, this is a placeholder where you can add more options yourself later
-
+  num_samples: 64
+  num_steps: 1000
 infrastructure:
   seed: 42
-  device: "cuda"
-  num_gpus: # int # 1 should be ok
-  mixed_precision: # bool # both true and false should work
-  compile_model: false # only tested false
-
+  device: cuda
+  mixed_precision: false
 checkpoint:
-  dir: "./checkpoints"
-  resume: null
-
+  resume_path: null
 logging:
-  dir: "./logs"
-  wandb:
-    enabled: true
-    project: "cmu-10799-diffusion"
-    entity: null
+  wandb: false
+  project: cmu-10799-ddpm
