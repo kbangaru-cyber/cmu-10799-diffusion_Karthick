@@ -32,7 +32,7 @@ import torch
 from tqdm import tqdm
 
 from src.models import create_model_from_config
-from src.data import save_image
+from src.data import save_image, unnormalize
 from src.methods import DDPM
 from src.utils import EMA
 
@@ -56,20 +56,32 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
 def save_samples(
     samples: torch.Tensor,
     save_path: str,
-    num_samples: int,
+    num_samples: int = 1,
+    nrow: int = 8,
 ) -> None:
     """
-    TODO: save generated samples as images.
+    Save generated samples.
+
+    - If num_samples == 1: saves a single image to save_path.
+    - If num_samples > 1: saves a grid to save_path.
 
     Args:
-        samples: Generated samples tensor with shape (num_samples, C, H, W).
-        save_path: File path to save the image grid.
-        num_samples: Number of samples, used to calculate grid layout.
+        samples: Tensor (N, C, H, W) in range [-1, 1]
+        save_path: Where to save
+        num_samples: How many samples from the batch to save
+        nrow: Images per row for grid saving
     """
+    if samples.dim() == 3:
+        samples = samples.unsqueeze(0)
 
-    raise NotImplementedError
+    samples = samples[:num_samples]
+    samples = unnormalize(samples).clamp(0.0, 1.0)
 
-
+    # For a single image, nrow=1 avoids extra padding/grid behavior
+    if num_samples == 1:
+        save_image(samples, save_path, nrow=1)
+    else:
+        save_image(samples, save_path, nrow=nrow)
 def main():
     parser = argparse.ArgumentParser(description='Generate samples from trained model')
     parser.add_argument('--checkpoint', type=str, required=True,
