@@ -84,11 +84,11 @@ class BaseMethod(nn.Module, ABC):
         """Set the model to evaluation mode."""
         self.model.eval()
     
-    def to(self, device: torch.device) -> "BaseMethod":
-        super().to(device)   # IMPORTANT: moves model + any registered buffers
+    def to(self, device: torch.device) -> 'BaseMethod':
+        """Move the entire method (model + buffers) to a device."""
+        super().to(device)
         self.device = device
         return self
-
     
     def parameters(self):
         """Return model parameters for optimizer."""
