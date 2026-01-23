@@ -29,7 +29,9 @@ training:
   batch_size: 64
   num_iterations: 2000
   training:
+  batch_size: 64
   learning_rate: 0.0002
+  betas: [0.9, 0.999]
   weight_decay: 0.0
   gradient_clip_norm: 1.0
   log_every: 50
