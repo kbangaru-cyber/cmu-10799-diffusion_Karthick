@@ -238,20 +238,20 @@ def generate_samples(
         ema.apply_shadow()
 
     sampling_cfg = config.get('sampling', {})
-num_steps = sampling_kwargs.get('num_steps', sampling_cfg.get('num_steps', None))
-if num_steps is None:
-    num_steps = getattr(method, 'num_timesteps', None)
-
-with torch.no_grad():
-    samples = method.sample(
-        batch_size=num_samples,
-        image_shape=image_shape,
-        num_steps=num_steps,
-        **sampling_kwargs,
-    )
-    if use_ema:
-        ema.restore()
-
+    num_steps = sampling_kwargs.get('num_steps', sampling_cfg.get('num_steps', None))
+    if num_steps is None:
+        num_steps = getattr(method, 'num_timesteps', None)
+    
+    with torch.no_grad():
+        samples = method.sample(
+            batch_size=num_samples,
+            image_shape=image_shape,
+            num_steps=num_steps,
+            **sampling_kwargs,
+        )
+        if use_ema:
+            ema.restore()
+    
     method.train_mode()
     return samples
 
