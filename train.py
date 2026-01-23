@@ -237,24 +237,18 @@ def generate_samples(
     if use_ema:
         ema.apply_shadow()
 
-    sampling_cfg = config.get("sampling", {})
+    sampling_cfg = config.get('sampling', {})
+num_steps = sampling_kwargs.get('num_steps', sampling_cfg.get('num_steps', None))
+if num_steps is None:
+    num_steps = getattr(method, 'num_timesteps', None)
 
-    # pull num_steps from kwargs or config, else fall back to method.num_timesteps
-    num_steps = sampling_kwargs.pop("num_steps", None)
-    if num_steps is None:
-        num_steps = sampling_cfg.get("num_steps", None)
-    if num_steps is None:
-        num_steps = getattr(method, "num_timesteps", 1000)
-
-    # call your method sampler
+with torch.no_grad():
     samples = method.sample(
         batch_size=num_samples,
         image_shape=image_shape,
         num_steps=num_steps,
         **sampling_kwargs,
     )
-
-
     if use_ema:
         ema.restore()
 
@@ -267,30 +261,11 @@ def save_samples(
     save_path: str,
     num_samples: int,
 ) -> None:
-    """
-    Save generated samples as an image grid.
-
-    Args:
-        samples: Generated samples tensor with shape (N, C, H, W) in range [-1, 1]
-        save_path: File path to save the image grid.
-        num_samples: Number of samples, used to calculate grid layout.
-    """
-    if samples is None:
-        raise ValueError("save_samples got samples=None. Did you implement generate_samples/method.sample()?")
-
-    if samples.dim() == 3:
-        samples = samples.unsqueeze(0)
-
-    # Keep only the requested number
-    samples = samples[:num_samples]
-
-    # Convert to [0,1] for saving
-    samples = unnormalize(samples).clamp(0.0, 1.0)
-
-    # Square-ish grid
-    nrow = int(math.ceil(math.sqrt(num_samples))) if num_samples > 1 else 1
-
-    # save_image is a thin wrapper over torchvision.utils.save_image
+    """Save generated samples as an image grid."""
+    samples = samples.detach().cpu()
+    samples = unnormalize(samples)
+    nrow = int(math.sqrt(num_samples))
+    nrow = max(1, nrow)
     save_image(samples, save_path, nrow=nrow)
 def train(
     method_name: str,
@@ -425,6 +400,7 @@ def train(
         print(f"Creating {method_name}...")
     if method_name == 'ddpm':
         method = DDPM.from_config(model, config, device)
+        method = method.to(device)
     else:
         raise ValueError(f"Unknown method: {method_name}. Only 'ddpm' is currently supported.")
 
