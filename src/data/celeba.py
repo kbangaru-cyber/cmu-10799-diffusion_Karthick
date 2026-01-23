@@ -232,16 +232,27 @@ class CelebADataset(Dataset):
         return data
     
     def _build_transforms(self) -> Callable:
-        """Build the preprocessing transforms."""
+        """Build the preprocessing transforms.
+
+        We want tensors in [-1, 1] for diffusion training.
+        """
         transform_list = []
 
-        # TODO: write your image transforms & augmentation
+        # Ensure deterministic size (dataset is 64x64, but keep it robust)
+        if self.image_size is not None:
+            # If input images aren't exactly image_size, resize/crop
+            transform_list.append(transforms.Resize(self.image_size, interpolation=transforms.InterpolationMode.BILINEAR))
+            transform_list.append(transforms.CenterCrop(self.image_size))
 
-        # Only resize if needed (dataset images are already 64x64)
+        # Light augmentation for faces
+        if self.augment and self.split == "train":
+            transform_list.append(transforms.RandomHorizontalFlip(p=0.5))
 
-        # For Data augmentation you can do something like
-        # if self.augment and self.split == "train":
-        #     transform_list.append(...)
+        # PIL -> tensor in [0,1]
+        transform_list.append(transforms.ToTensor())
+
+        # [0,1] -> [-1,1]
+        transform_list.append(transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]))
 
         return transforms.Compose(transform_list)
 
