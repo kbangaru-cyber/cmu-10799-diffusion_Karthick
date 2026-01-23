@@ -32,7 +32,7 @@ import torch
 from tqdm import tqdm
 
 from src.models import create_model_from_config
-from src.data import save_image, unnormalize
+from src.data import save_image
 from src.methods import DDPM
 from src.utils import EMA
 
@@ -53,35 +53,11 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
     return model, config, ema
 
 
-def save_samples(
-    samples: torch.Tensor,
-    save_path: str,
-    num_samples: int = 1,
-    nrow: int = 8,
-) -> None:
-    """
-    Save generated samples.
-
-    - If num_samples == 1: saves a single image to save_path.
-    - If num_samples > 1: saves a grid to save_path.
-
-    Args:
-        samples: Tensor (N, C, H, W) in range [-1, 1]
-        save_path: Where to save
-        num_samples: How many samples from the batch to save
-        nrow: Images per row for grid saving
-    """
-    if samples.dim() == 3:
-        samples = samples.unsqueeze(0)
-
-    samples = samples[:num_samples]
-    samples = unnormalize(samples).clamp(0.0, 1.0)
-
-    # For a single image, nrow=1 avoids extra padding/grid behavior
-    if num_samples == 1:
-        save_image(samples, save_path, nrow=1)
-    else:
-        save_image(samples, save_path, nrow=nrow)
+def save_samples(samples: torch.Tensor, save_path: str, nrow: int = 8) -> None:
+    """Save a batch of samples as an image (grid if batch>1)."""
+    samples = samples.detach().cpu()
+    samples = unnormalize(samples)
+    save_image(samples, save_path, nrow=nrow)
 def main():
     parser = argparse.ArgumentParser(description='Generate samples from trained model')
     parser.add_argument('--checkpoint', type=str, required=True,
@@ -131,6 +107,7 @@ def main():
     # Create method
     if args.method == 'ddpm':
         method = DDPM.from_config(model, config, device)
+        method = method.to(device)
     else:
         raise ValueError(f"Unknown method: {args.method}. Only 'ddpm' is currently supported.")
     
@@ -169,7 +146,6 @@ def main():
                 batch_size=batch_size,
                 image_shape=image_shape,
                 num_steps=num_steps,
-                # TODO: add your arugments here
             )
 
             # Save individual images immediately or collect for grid
@@ -178,7 +154,7 @@ def main():
             else:
                 for i in range(samples.shape[0]):
                     img_path = os.path.join(args.output_dir, f"{sample_idx:06d}.png")
-                    save_samples(samples, img_path, 1)
+                    save_samples(samples[i:i+1], img_path, nrow=1)
                     sample_idx += 1
 
             remaining -= batch_size
