@@ -58,7 +58,8 @@ def load_config(config_path: str) -> dict:
 def setup_logging(config: dict, method_name: str) -> tuple[str, Any]:
     """Set up logging directories and wandb. Returns (log_dir, wandb_run)."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = os.path.join(config['logging']['dir'], f"{method_name}_{timestamp}")
+    log_root = config.get('logging', {}).get('dir', './logs')
+    log_dir = os.path.join(log_root, f"{method_name}_{timestamp}")
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(os.path.join(log_dir, 'samples'), exist_ok=True)
     os.makedirs(os.path.join(log_dir, 'checkpoints'), exist_ok=True)
@@ -71,7 +72,9 @@ def setup_logging(config: dict, method_name: str) -> tuple[str, Any]:
 
     # Initialize wandb if enabled
     wandb_run = None
-    wandb_config = config['logging'].get('wandb', {})
+    wandb_config = config.get('logging', {}).get('wandb', {})
+    if isinstance(wandb_config, bool):
+        wandb_config = {'enabled': wandb_config}
     if wandb_config.get('enabled', False):
         try:
             wandb_run = wandb.init(
@@ -141,13 +144,23 @@ def reduce_metrics(
 
 
 def create_optimizer(model: nn.Module, config: dict) -> torch.optim.Optimizer:
-    """Create optimizer from config."""
-    training_config = config['training']
+    """Create optimizer from config (robust to schema variations)."""
+    training_config = config.get('training', {}) or {}
+    lr = training_config.get('learning_rate', training_config.get('lr', 2e-4))
+    betas = training_config.get('betas', (0.9, 0.999))
+    weight_decay = training_config.get('weight_decay', 0.0)
+
+    # Normalize betas to a tuple[float,float]
+    if isinstance(betas, (list, tuple)) and len(betas) == 2:
+        betas = (float(betas[0]), float(betas[1]))
+    else:
+        betas = (0.9, 0.999)
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=training_config['learning_rate'],
-        betas=tuple(training_config['betas']),
-        weight_decay=training_config['weight_decay'],
+        lr=float(lr),
+        betas=betas,
+        weight_decay=float(weight_decay),
     )
     return optimizer
 
@@ -237,21 +250,12 @@ def generate_samples(
     if use_ema:
         ema.apply_shadow()
 
-    sampling_cfg = config.get('sampling', {})
-    num_steps = sampling_kwargs.get('num_steps', sampling_cfg.get('num_steps', None))
-    if num_steps is None:
-        num_steps = getattr(method, 'num_timesteps', None)
-    
-    with torch.no_grad():
-        samples = method.sample(
-            batch_size=num_samples,
-            image_shape=image_shape,
-            num_steps=num_steps,
-            **sampling_kwargs,
-        )
-        if use_ema:
-            ema.restore()
-    
+    samples = None
+    # TODO: sample with your method.sample()
+
+    if use_ema:
+        ema.restore()
+
     method.train_mode()
     return samples
 
@@ -261,12 +265,18 @@ def save_samples(
     save_path: str,
     num_samples: int,
 ) -> None:
-    """Save generated samples as an image grid."""
-    samples = samples.detach().cpu()
-    samples = unnormalize(samples)
-    nrow = int(math.sqrt(num_samples))
-    nrow = max(1, nrow)
-    save_image(samples, save_path, nrow=nrow)
+    """
+    TODO: save generated samples as images.
+
+    Args:
+        samples: Generated samples tensor with shape (num_samples, C, H, W).
+        save_path: File path to save the image grid.
+        num_samples: Number of samples, used to calculate grid layout.
+    """
+
+    raise NotImplementedError
+
+
 def train(
     method_name: str,
     config: dict,
@@ -286,8 +296,8 @@ def train(
     rank, world_size, local_rank = get_distributed_context()
 
     # Check if config wants distributed training
-    config_device = config['infrastructure'].get('device', 'cuda')
-    config_num_gpus = config['infrastructure'].get('num_gpus', None)
+    config_device = (config.get('infrastructure', {}) or {}).get('device', 'cuda')
+    config_num_gpus = (config.get('infrastructure', {}) or {}).get('num_gpus', None)
 
     # Distributed only if: world_size > 1 AND config allows it
     # Config disables distributed if: device='cpu' OR num_gpus=1
@@ -335,17 +345,17 @@ def train(
                 print(f"✓ CPU training")
                 print(f"  - Device: {device}")
         print(f"  - Config device setting: {config_device}")
-        print(f"  - Mixed precision: {config['infrastructure'].get('mixed_precision', False)}")
+        print(f"  - Mixed precision: {(config.get('infrastructure', {}) or {}).get('mixed_precision', False)}")
         print("=" * 60)
 
     # Set seed for reproducibility
-    seed = config['infrastructure']['seed']
+    seed = (config.get('infrastructure', {}) or {}).get('seed', 42)
     torch.manual_seed(seed)  # Same seed for all ranks for model init
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
 
-    training_config = config['training']
-    data_config = config['data']
+    training_config = config.get('training', {}) or {}
+    data_config = config.get('data', {}) or {}
 
     # Create data loader
     if is_main_process:
@@ -362,10 +372,10 @@ def train(
         )
         dataloader = DataLoader(
             dataloader.dataset,
-            batch_size=training_config['batch_size'],
+            batch_size=int(training_config.get('batch_size', 64)),
             sampler=sampler,
-            num_workers=data_config['num_workers'],
-            pin_memory=data_config['pin_memory'],
+            num_workers=int(data_config.get('num_workers', 4)),
+            pin_memory=bool(data_config.get('pin_memory', True)),
             drop_last=True,
         )
 
@@ -399,21 +409,34 @@ def train(
     if is_main_process:
         print(f"Creating {method_name}...")
     if method_name == 'ddpm':
+    if hasattr(DDPM, "from_config"):
         method = DDPM.from_config(model, config, device)
-        method = method.to(device)
     else:
-        raise ValueError(f"Unknown method: {method_name}. Only 'ddpm' is currently supported.")
+        ddpm_cfg = config.get("ddpm", {}) or {}
+        method = DDPM(
+            model=model,
+            device=device,
+            num_timesteps=int(ddpm_cfg.get("num_timesteps", 1000)),
+            beta_start=float(ddpm_cfg.get("beta_start", 1e-4)),
+            beta_end=float(ddpm_cfg.get("beta_end", 2e-2)),
+        )
+    # Ensure both model + buffers live on the right device
+    if hasattr(method, "to"):
+        method = method.to(device)
+else:
+    raise ValueError(f"Unknown method: {method_name}. Only 'ddpm' is currently supported.")
 
     # Create optimizer
     optimizer = create_optimizer(model, config) # default to AdamW optimizer
 
     # Create EMA
-    ema = EMA(unwrap_model(model), decay=config['training']['ema_decay'])
+    ema_decay = float(training_config.get('ema_decay', 0.9999))
+    ema = EMA(unwrap_model(model), decay=ema_decay)
 
     # Create gradient scaler for mixed precision
     # Determine device type for GradScaler (cuda or cpu)
     device_type = 'cuda' if device.type == 'cuda' else 'cpu'
-    scaler = GradScaler(device_type, enabled=config['infrastructure']['mixed_precision'])
+    scaler = GradScaler(device_type, enabled=(config.get('infrastructure', {}) or {}).get('mixed_precision', False))
 
     # Setup logging
     log_dir = None
@@ -444,16 +467,24 @@ def train(
             dist.barrier()
         start_step = load_checkpoint(resume_path, model, optimizer, ema, scaler, device)
     
-    # Training config
-    num_iterations = training_config['num_iterations']
-    log_every = training_config['log_every']
-    sample_every = training_config['sample_every']
-    save_every = training_config['save_every']
-    num_samples = training_config['num_samples']
-    gradient_clip_norm = training_config['gradient_clip_norm']
-    
-    # Image shape for sampling
-    image_shape = (data_config['channels'], data_config['image_size'], data_config['image_size'])
+    # Training config (robust defaults)
+num_iterations = int(training_config.get('num_iterations', training_config.get('max_steps', 2000)))
+log_every = int(training_config.get('log_every', 50))
+sample_every = training_config.get('sample_every', training_config.get('eval_every', 200))
+save_every = training_config.get('save_every', training_config.get('checkpoint_every', 1000))
+
+# Allow disabling by setting <=0 / None
+sample_every = None if sample_every is None or int(sample_every) <= 0 else int(sample_every)
+save_every = None if save_every is None or int(save_every) <= 0 else int(save_every)
+
+num_samples = int(training_config.get('num_samples', (config.get('sampling', {}) or {}).get('num_samples', 64)))
+gradient_clip_norm = float(training_config.get('gradient_clip_norm', 1.0))
+
+# Image shape for sampling
+channels = int(data_config.get('channels', 3))
+image_size = int(data_config.get('image_size', 64))
+image_shape = (channels, image_size, image_size)
+
     
     # Training loop
     if is_main_process:
@@ -482,7 +513,7 @@ def train(
 
         # Replicate to match desired batch size
         base_batch_size = single_batch_base.shape[0]
-        desired_batch_size = training_config['batch_size']
+        desired_batch_size = int(training_config.get('batch_size', single_batch_base.shape[0]))
 
         if desired_batch_size > base_batch_size:
             # Replicate the batch to reach desired size
@@ -529,7 +560,7 @@ def train(
         # Forward pass with mixed precision
         optimizer.zero_grad()
         
-        with autocast(device_type, enabled=config['infrastructure']['mixed_precision']):
+        with autocast(device_type, enabled=(config.get('infrastructure', {}) or {}).get('mixed_precision', False)):
             loss, metrics = method.compute_loss(batch)
         
         # Backward pass
@@ -555,7 +586,7 @@ def train(
         metrics_count += 1
         
         # Logging
-        if (step + 1) % log_every == 0:
+        if log_every and (step + 1) % log_every == 0:
             elapsed = time.time() - start_time
             steps_per_sec = metrics_count / elapsed
 
@@ -595,7 +626,7 @@ def train(
             start_time = time.time()
 
         # Generate samples
-        if (step + 1) % sample_every == 0:
+        if sample_every and (step + 1) % sample_every == 0:
             if is_main_process:
                 print(f"\nGenerating samples at step {step + 1}...")
                 samples = generate_samples(
@@ -627,7 +658,7 @@ def train(
                 dist.barrier()
 
         # Save checkpoint
-        if (step + 1) % save_every == 0:
+        if save_every and (step + 1) % save_every == 0:
             if is_main_process:
                 checkpoint_path = os.path.join(log_dir, 'checkpoints', f'{method_name}_{step + 1:07d}.pt')
                 save_checkpoint(checkpoint_path, model, optimizer, ema, scaler, step + 1, config)
@@ -678,6 +709,7 @@ def main():
 
     # Override with resume path if specified
     if args.resume:
+        config.setdefault('checkpoint', {})
         config['checkpoint']['resume'] = args.resume
 
     # Train
