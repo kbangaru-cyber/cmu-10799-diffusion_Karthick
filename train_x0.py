@@ -58,24 +58,34 @@ def load_config(config_path: str) -> dict:
 def setup_logging(config: dict, method_name: str) -> tuple[str, Any]:
     """Set up logging directories and wandb. Returns (log_dir, wandb_run)."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = os.path.join(config['logging']['dir'], f"{method_name}_{timestamp}")
+    logging_cfg = config.get('logging', {}) or {}
+    if isinstance(logging_cfg, bool) or logging_cfg is None:
+        logging_cfg = {}
+
+    log_root = logging_cfg.get('dir', './logs')
+    log_dir = os.path.join(log_root, f"{method_name}_{timestamp}")
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(os.path.join(log_dir, 'samples'), exist_ok=True)
     os.makedirs(os.path.join(log_dir, 'checkpoints'), exist_ok=True)
 
     # Save config
     with open(os.path.join(log_dir, 'config.yaml'), 'w') as f:
-        yaml.dump(config, f)
+        yaml.safe_dump(config, f)
 
     print(f"Logging to: {log_dir}")
 
     # Initialize wandb if enabled
     wandb_run = None
-    wandb_config = config['logging'].get('wandb', {})
+    wandb_config = logging_cfg.get('wandb', {})
+    if isinstance(wandb_config, bool) or wandb_config is None:
+        wandb_config = {'enabled': bool(wandb_config)}
+    if not isinstance(wandb_config, dict):
+        wandb_config = {'enabled': False}
+
     if wandb_config.get('enabled', False):
         try:
             wandb_run = wandb.init(
-                project=wandb_config.get('project', 'cmu-10799-diffusion'),
+                project=wandb_config.get('project', logging_cfg.get('project', 'cmu-10799-diffusion')),
                 entity=wandb_config.get('entity', None),
                 name=f"{method_name}_{timestamp}",
                 config=config,
@@ -83,10 +93,9 @@ def setup_logging(config: dict, method_name: str) -> tuple[str, Any]:
                 tags=[method_name],
             )
             print(f"Weights & Biases: {wandb_run.url}")
-        except ImportError:
-            print("Warning: wandb not installed. Install with: pip install wandb")
         except Exception as e:
             print(f"Warning: Failed to initialize wandb: {e}")
+            wandb_run = None
 
     return log_dir, wandb_run
 
@@ -141,13 +150,22 @@ def reduce_metrics(
 
 
 def create_optimizer(model: nn.Module, config: dict) -> torch.optim.Optimizer:
-    """Create optimizer from config."""
-    training_config = config['training']
+    """Create optimizer from config (robust to schema variations)."""
+    training_config = config.get('training', {}) or {}
+    lr = training_config.get('learning_rate', training_config.get('lr', 2e-4))
+    betas = training_config.get('betas', (0.9, 0.999))
+    weight_decay = training_config.get('weight_decay', 0.0)
+
+    if isinstance(betas, (list, tuple)) and len(betas) == 2:
+        betas = (float(betas[0]), float(betas[1]))
+    else:
+        betas = (0.9, 0.999)
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=training_config['learning_rate'],
-        betas=tuple(training_config['betas']),
-        weight_decay=training_config['weight_decay'],
+        lr=float(lr),
+        betas=betas,
+        weight_decay=float(weight_decay),
     )
     return optimizer
 
@@ -208,40 +226,33 @@ def generate_samples(
     current_step: Optional[int] = None,
     **sampling_kwargs,
 ) -> torch.Tensor:
-    """Generate samples (optionally using EMA weights)."""
+    """Generate samples (uses EMA weights if available and enabled)."""
     method.eval_mode()
 
-    training_cfg = config.get("training", {}) or {}
-    sampling_cfg = config.get("sampling", {}) or {}
-    ddpm_cfg = config.get("ddpm", {}) or {}
-
-    # Prefer sampling.num_steps, else fall back to ddpm.num_timesteps
-    num_steps = sampling_cfg.get("num_steps", ddpm_cfg.get("num_timesteps", 1000))
-    try:
-        num_steps = int(num_steps)
-    except Exception:
-        num_steps = 1000
-
-    ema_start = int(training_cfg.get("ema_start", 0))
+    training_cfg = config.get('training', {}) or {}
+    ema_start = int(training_cfg.get('ema_start', 0))
     use_ema = ema is not None and (current_step is None or int(current_step) >= ema_start)
+
     if use_ema:
         ema.apply_shadow()
 
-    try:
-        samples = method.sample(batch_size=num_samples, image_shape=image_shape, num_steps=num_steps, **sampling_kwargs)
-    except TypeError:
-        samples = method.sample(num_samples, image_shape, num_steps)
+    # sampler args
+    sampling_cfg = config.get('sampling', {}) or {}
+    num_steps = int(sampling_kwargs.get('num_steps', sampling_cfg.get('num_steps', sampling_cfg.get('steps', 1000))))
+    eta = float(sampling_kwargs.get('eta', sampling_cfg.get('eta', 0.0)))
 
-    if samples is None:
-        raise ValueError("generate_samples got samples=None. Implement method.sample() to return a tensor.")
+    samples = method.sample(
+        batch_size=int(num_samples),
+        image_shape=image_shape,
+        num_steps=num_steps,
+        eta=eta,
+    )
 
     if use_ema:
         ema.restore()
 
     method.train_mode()
     return samples
-
-
 def save_samples(
     samples: torch.Tensor,
     save_path: str,
@@ -439,11 +450,11 @@ def train(
         start_step = load_checkpoint(resume_path, model, optimizer, ema, scaler, device)
     
     # Training config
-    num_iterations = training_config['num_iterations']
-    log_every = training_config['log_every']
-    sample_every = training_config['sample_every']
-    save_every = training_config['save_every']
-    num_samples = training_config['num_samples']
+    num_iterations = training_config.get('num_iterations', training_config.get('max_steps', 2000))
+    log_every = training_config.get('log_every', 50)
+    sample_every = training_config.get('sample_every', training_config.get('eval_every', 200))
+    save_every = training_config.get('save_every', training_config.get('checkpoint_every', 1000))
+    num_samples = training_config.get('num_samples', (config.get('sampling', {}) or {}).get('num_samples', 64))
     gradient_clip_norm = training_config['gradient_clip_norm']
     
     # Image shape for sampling
