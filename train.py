@@ -409,284 +409,284 @@ def train(
     if is_main_process:
         print(f"Creating {method_name}...")
     if method_name == 'ddpm':
-    if hasattr(DDPM, "from_config"):
-        method = DDPM.from_config(model, config, device)
+        if hasattr(DDPM, "from_config"):
+            method = DDPM.from_config(model, config, device)
+        else:
+            ddpm_cfg = config.get("ddpm", {}) or {}
+            method = DDPM(
+                model=model,
+                device=device,
+                num_timesteps=int(ddpm_cfg.get("num_timesteps", 1000)),
+                beta_start=float(ddpm_cfg.get("beta_start", 1e-4)),
+                beta_end=float(ddpm_cfg.get("beta_end", 2e-2)),
+            )
+        # Ensure both model + buffers live on the right device
+        if hasattr(method, "to"):
+            method = method.to(device)
     else:
-        ddpm_cfg = config.get("ddpm", {}) or {}
-        method = DDPM(
-            model=model,
-            device=device,
-            num_timesteps=int(ddpm_cfg.get("num_timesteps", 1000)),
-            beta_start=float(ddpm_cfg.get("beta_start", 1e-4)),
-            beta_end=float(ddpm_cfg.get("beta_end", 2e-2)),
+        raise ValueError(f"Unknown method: {method_name}. Only 'ddpm' is currently supported.")
+    
+        # Create optimizer
+        optimizer = create_optimizer(model, config) # default to AdamW optimizer
+    
+        # Create EMA
+        ema_decay = float(training_config.get('ema_decay', 0.9999))
+        ema = EMA(unwrap_model(model), decay=ema_decay)
+    
+        # Create gradient scaler for mixed precision
+        # Determine device type for GradScaler (cuda or cpu)
+        device_type = 'cuda' if device.type == 'cuda' else 'cpu'
+        scaler = GradScaler(device_type, enabled=(config.get('infrastructure', {}) or {}).get('mixed_precision', False))
+    
+        # Setup logging
+        log_dir = None
+        wandb_run = None
+        if is_main_process:
+            log_dir, wandb_run = setup_logging(config, method_name)
+    
+        # Log model info to wandb
+        if is_main_process and wandb_run is not None:
+            try:
+                wandb.log({
+                    'model/parameters': num_params,
+                    'model/parameters_millions': num_params / 1e6,
+                    'data/dataset_size': len(dataloader.dataset),
+                    'data/batches_per_epoch': len(dataloader),
+                }, step=0)
+                # Watch model gradients and parameters
+                # wandb.watch(model, log='all', log_freq=config['training']['log_every'])
+            except Exception as e:
+                print(f"Warning: Failed to log model info to wandb: {e}")
+    
+    
+        # Resume from checkpoint if specified
+        start_step = 0
+        if resume_path is not None:
+            # Barrier to ensure all processes wait before loading checkpoint
+            if is_distributed:
+                dist.barrier()
+            start_step = load_checkpoint(resume_path, model, optimizer, ema, scaler, device)
+        
+        # Training config (robust defaults)
+    num_iterations = int(training_config.get('num_iterations', training_config.get('max_steps', 2000)))
+    log_every = int(training_config.get('log_every', 50))
+    sample_every = training_config.get('sample_every', training_config.get('eval_every', 200))
+    save_every = training_config.get('save_every', training_config.get('checkpoint_every', 1000))
+    
+    # Allow disabling by setting <=0 / None
+    sample_every = None if sample_every is None or int(sample_every) <= 0 else int(sample_every)
+    save_every = None if save_every is None or int(save_every) <= 0 else int(save_every)
+    
+    num_samples = int(training_config.get('num_samples', (config.get('sampling', {}) or {}).get('num_samples', 64)))
+    gradient_clip_norm = float(training_config.get('gradient_clip_norm', 1.0))
+    
+    # Image shape for sampling
+    channels = int(data_config.get('channels', 3))
+    image_size = int(data_config.get('image_size', 64))
+    image_shape = (channels, image_size, image_size)
+    
+        
+        # Training loop
+        if is_main_process:
+            print(f"\nStarting training from step {start_step}...")
+            print(f"Total iterations: {num_iterations}")
+            if overfit_single_batch:
+                print("DEBUG MODE: Overfitting to a single batch")
+            print("-" * 50)
+    
+        method.train_mode()
+        data_iter = iter(dataloader)
+        epoch = 0
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+    
+        # Pro tips: before big training runs, it's usually a good idea to sanity check 
+        # by overfitting to a single batch with a small number of training iterations
+        # For single batch overfitting, grab one batch and reuse it
+        single_batch = None
+        single_batch_base = None  # Store the original small batch
+        if overfit_single_batch:
+            single_batch_base = next(data_iter)
+            if isinstance(single_batch_base, (tuple, list)):
+                single_batch_base = single_batch_base[0]  # Handle (image, label) tuples
+            single_batch_base = single_batch_base.to(device)
+    
+            # Replicate to match desired batch size
+            base_batch_size = single_batch_base.shape[0]
+            desired_batch_size = int(training_config.get('batch_size', single_batch_base.shape[0]))
+    
+            if desired_batch_size > base_batch_size:
+                # Replicate the batch to reach desired size
+                num_repeats = (desired_batch_size + base_batch_size - 1) // base_batch_size
+                single_batch = single_batch_base.repeat(num_repeats, 1, 1, 1)[:desired_batch_size]
+                if is_main_process:
+                    print(f"Cached single batch: {base_batch_size} samples replicated to {desired_batch_size}")
+                    print(f"  Base batch shape: {single_batch_base.shape}")
+                    print(f"  Training batch shape: {single_batch.shape}")
+            else:
+                single_batch = single_batch_base
+                if is_main_process:
+                    print(f"Cached single batch with shape: {single_batch.shape}")
+    
+        metrics_sum = {}
+        metrics_count = 0
+        start_time = time.time()
+    
+        pbar = tqdm(
+            range(start_step, num_iterations),
+            initial=start_step,
+            total=num_iterations,
+            disable=not is_main_process,
         )
-    # Ensure both model + buffers live on the right device
-    if hasattr(method, "to"):
-        method = method.to(device)
-else:
-    raise ValueError(f"Unknown method: {method_name}. Only 'ddpm' is currently supported.")
-
-    # Create optimizer
-    optimizer = create_optimizer(model, config) # default to AdamW optimizer
-
-    # Create EMA
-    ema_decay = float(training_config.get('ema_decay', 0.9999))
-    ema = EMA(unwrap_model(model), decay=ema_decay)
-
-    # Create gradient scaler for mixed precision
-    # Determine device type for GradScaler (cuda or cpu)
-    device_type = 'cuda' if device.type == 'cuda' else 'cpu'
-    scaler = GradScaler(device_type, enabled=(config.get('infrastructure', {}) or {}).get('mixed_precision', False))
-
-    # Setup logging
-    log_dir = None
-    wandb_run = None
-    if is_main_process:
-        log_dir, wandb_run = setup_logging(config, method_name)
-
-    # Log model info to wandb
-    if is_main_process and wandb_run is not None:
-        try:
-            wandb.log({
-                'model/parameters': num_params,
-                'model/parameters_millions': num_params / 1e6,
-                'data/dataset_size': len(dataloader.dataset),
-                'data/batches_per_epoch': len(dataloader),
-            }, step=0)
-            # Watch model gradients and parameters
-            # wandb.watch(model, log='all', log_freq=config['training']['log_every'])
-        except Exception as e:
-            print(f"Warning: Failed to log model info to wandb: {e}")
-
-
-    # Resume from checkpoint if specified
-    start_step = 0
-    if resume_path is not None:
-        # Barrier to ensure all processes wait before loading checkpoint
+        for step in pbar:
+            # Get batch (cycle through dataset or use single batch)
+            if overfit_single_batch:
+                batch = single_batch
+            else:
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    epoch += 1
+                    if sampler is not None:
+                        sampler.set_epoch(epoch)
+                    data_iter = iter(dataloader)
+                    batch = next(data_iter)
+    
+                if isinstance(batch, (tuple, list)):
+                    batch = batch[0]  # Handle (image, label) tuples
+    
+                batch = batch.to(device)
+            
+            # Forward pass with mixed precision
+            optimizer.zero_grad()
+            
+            with autocast(device_type, enabled=(config.get('infrastructure', {}) or {}).get('mixed_precision', False)):
+                loss, metrics = method.compute_loss(batch)
+            
+            # Backward pass
+            scaler.scale(loss).backward()
+            
+            # Gradient clipping
+            if gradient_clip_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+            
+            # Optimizer step
+            scaler.step(optimizer)
+            scaler.update()
+    
+            # EMA update - DISABLED
+            ema.update()
+            
+            # Accumulate metrics (store raw values, will reduce when logging)
+            for k, v in metrics.items():
+                if k not in metrics_sum:
+                    metrics_sum[k] = []
+                metrics_sum[k].append(v.detach().item() if torch.is_tensor(v) else float(v))
+            metrics_count += 1
+            
+            # Logging
+            if log_every and (step + 1) % log_every == 0:
+                elapsed = time.time() - start_time
+                steps_per_sec = metrics_count / elapsed
+    
+                # Average metrics locally first
+                local_avg_metrics = {k: sum(v) / len(v) for k, v in metrics_sum.items()}
+    
+                # Reduce metrics across all ranks
+                avg_metrics = reduce_metrics(local_avg_metrics, device, world_size)
+    
+                # Update progress bar
+                if is_main_process:
+                    pbar.set_postfix({
+                        'loss': f"{avg_metrics['loss']:.4f}",
+                        'steps/s': f"{steps_per_sec:.2f}",
+                    })
+    
+                # Log to wandb
+                if is_main_process and wandb_run is not None:
+                    log_dict = {
+                        'train/step': step + 1,
+                        'train/steps_per_sec': steps_per_sec,
+                        'train/learning_rate': optimizer.param_groups[0]['lr'],
+                    }
+                    # Add all metrics
+                    for k, v in avg_metrics.items():
+                        log_dict[f'train/{k}'] = v
+    
+                    try:
+                        wandb.log(log_dict, step=step + 1)
+                    except Exception as e:
+                        print(f"Warning: Failed to log to wandb: {e}")
+    
+    
+                # Reset metrics
+                metrics_sum = {}
+                metrics_count = 0
+                start_time = time.time()
+    
+            # Generate samples
+            if sample_every and (step + 1) % sample_every == 0:
+                if is_main_process:
+                    print(f"\nGenerating samples at step {step + 1}...")
+                    samples = generate_samples(
+                        method,
+                        num_samples,
+                        image_shape,
+                        device,
+                        method_name,
+                        config,
+                        ema,
+                        current_step=step + 1,
+                    )
+                    sample_path = os.path.join(log_dir, 'samples', f'samples_{step + 1:07d}.png')
+                    save_samples(samples, sample_path, num_samples)
+    
+                    # Log samples to wandb
+                    if wandb_run is not None:
+                        try:
+                            # Load the saved image and log it
+                            img = PILImage.open(sample_path)
+                            wandb.log({
+                                'samples': wandb.Image(img, caption=f'Step {step + 1}')
+                            }, step=step + 1)
+                        except Exception as e:
+                            print(f"Warning: Failed to log samples to wandb: {e}")
+    
+                # Barrier to synchronize all processes after sampling
+                if is_distributed:
+                    dist.barrier()
+    
+            # Save checkpoint
+            if save_every and (step + 1) % save_every == 0:
+                if is_main_process:
+                    checkpoint_path = os.path.join(log_dir, 'checkpoints', f'{method_name}_{step + 1:07d}.pt')
+                    save_checkpoint(checkpoint_path, model, optimizer, ema, scaler, step + 1, config)
+    
+                # Barrier to synchronize all processes after checkpoint save
+                if is_distributed:
+                    dist.barrier()
+        
+        # Save final checkpoint
+        if is_main_process:
+            final_path = os.path.join(log_dir, 'checkpoints', f'{method_name}_final.pt')
+            save_checkpoint(final_path, model, optimizer, ema, scaler, num_iterations, config)
+    
+            print("\nTraining complete!")
+            print(f"Final checkpoint: {final_path}")
+            print(f"Samples saved to: {os.path.join(log_dir, 'samples')}")
+    
+        # Finish wandb run
+        if is_main_process and wandb_run is not None:
+            try:
+                wandb.finish()
+            except Exception as e:
+                print(f"Warning: Failed to finish wandb run: {e}")
+    
+        # Final barrier before cleanup
         if is_distributed:
             dist.barrier()
-        start_step = load_checkpoint(resume_path, model, optimizer, ema, scaler, device)
-    
-    # Training config (robust defaults)
-num_iterations = int(training_config.get('num_iterations', training_config.get('max_steps', 2000)))
-log_every = int(training_config.get('log_every', 50))
-sample_every = training_config.get('sample_every', training_config.get('eval_every', 200))
-save_every = training_config.get('save_every', training_config.get('checkpoint_every', 1000))
-
-# Allow disabling by setting <=0 / None
-sample_every = None if sample_every is None or int(sample_every) <= 0 else int(sample_every)
-save_every = None if save_every is None or int(save_every) <= 0 else int(save_every)
-
-num_samples = int(training_config.get('num_samples', (config.get('sampling', {}) or {}).get('num_samples', 64)))
-gradient_clip_norm = float(training_config.get('gradient_clip_norm', 1.0))
-
-# Image shape for sampling
-channels = int(data_config.get('channels', 3))
-image_size = int(data_config.get('image_size', 64))
-image_shape = (channels, image_size, image_size)
-
-    
-    # Training loop
-    if is_main_process:
-        print(f"\nStarting training from step {start_step}...")
-        print(f"Total iterations: {num_iterations}")
-        if overfit_single_batch:
-            print("DEBUG MODE: Overfitting to a single batch")
-        print("-" * 50)
-
-    method.train_mode()
-    data_iter = iter(dataloader)
-    epoch = 0
-    if sampler is not None:
-        sampler.set_epoch(epoch)
-
-    # Pro tips: before big training runs, it's usually a good idea to sanity check 
-    # by overfitting to a single batch with a small number of training iterations
-    # For single batch overfitting, grab one batch and reuse it
-    single_batch = None
-    single_batch_base = None  # Store the original small batch
-    if overfit_single_batch:
-        single_batch_base = next(data_iter)
-        if isinstance(single_batch_base, (tuple, list)):
-            single_batch_base = single_batch_base[0]  # Handle (image, label) tuples
-        single_batch_base = single_batch_base.to(device)
-
-        # Replicate to match desired batch size
-        base_batch_size = single_batch_base.shape[0]
-        desired_batch_size = int(training_config.get('batch_size', single_batch_base.shape[0]))
-
-        if desired_batch_size > base_batch_size:
-            # Replicate the batch to reach desired size
-            num_repeats = (desired_batch_size + base_batch_size - 1) // base_batch_size
-            single_batch = single_batch_base.repeat(num_repeats, 1, 1, 1)[:desired_batch_size]
-            if is_main_process:
-                print(f"Cached single batch: {base_batch_size} samples replicated to {desired_batch_size}")
-                print(f"  Base batch shape: {single_batch_base.shape}")
-                print(f"  Training batch shape: {single_batch.shape}")
-        else:
-            single_batch = single_batch_base
-            if is_main_process:
-                print(f"Cached single batch with shape: {single_batch.shape}")
-
-    metrics_sum = {}
-    metrics_count = 0
-    start_time = time.time()
-
-    pbar = tqdm(
-        range(start_step, num_iterations),
-        initial=start_step,
-        total=num_iterations,
-        disable=not is_main_process,
-    )
-    for step in pbar:
-        # Get batch (cycle through dataset or use single batch)
-        if overfit_single_batch:
-            batch = single_batch
-        else:
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                epoch += 1
-                if sampler is not None:
-                    sampler.set_epoch(epoch)
-                data_iter = iter(dataloader)
-                batch = next(data_iter)
-
-            if isinstance(batch, (tuple, list)):
-                batch = batch[0]  # Handle (image, label) tuples
-
-            batch = batch.to(device)
-        
-        # Forward pass with mixed precision
-        optimizer.zero_grad()
-        
-        with autocast(device_type, enabled=(config.get('infrastructure', {}) or {}).get('mixed_precision', False)):
-            loss, metrics = method.compute_loss(batch)
-        
-        # Backward pass
-        scaler.scale(loss).backward()
-        
-        # Gradient clipping
-        if gradient_clip_norm > 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
-        
-        # Optimizer step
-        scaler.step(optimizer)
-        scaler.update()
-
-        # EMA update - DISABLED
-        ema.update()
-        
-        # Accumulate metrics (store raw values, will reduce when logging)
-        for k, v in metrics.items():
-            if k not in metrics_sum:
-                metrics_sum[k] = []
-            metrics_sum[k].append(v.detach().item() if torch.is_tensor(v) else float(v))
-        metrics_count += 1
-        
-        # Logging
-        if log_every and (step + 1) % log_every == 0:
-            elapsed = time.time() - start_time
-            steps_per_sec = metrics_count / elapsed
-
-            # Average metrics locally first
-            local_avg_metrics = {k: sum(v) / len(v) for k, v in metrics_sum.items()}
-
-            # Reduce metrics across all ranks
-            avg_metrics = reduce_metrics(local_avg_metrics, device, world_size)
-
-            # Update progress bar
-            if is_main_process:
-                pbar.set_postfix({
-                    'loss': f"{avg_metrics['loss']:.4f}",
-                    'steps/s': f"{steps_per_sec:.2f}",
-                })
-
-            # Log to wandb
-            if is_main_process and wandb_run is not None:
-                log_dict = {
-                    'train/step': step + 1,
-                    'train/steps_per_sec': steps_per_sec,
-                    'train/learning_rate': optimizer.param_groups[0]['lr'],
-                }
-                # Add all metrics
-                for k, v in avg_metrics.items():
-                    log_dict[f'train/{k}'] = v
-
-                try:
-                    wandb.log(log_dict, step=step + 1)
-                except Exception as e:
-                    print(f"Warning: Failed to log to wandb: {e}")
-
-
-            # Reset metrics
-            metrics_sum = {}
-            metrics_count = 0
-            start_time = time.time()
-
-        # Generate samples
-        if sample_every and (step + 1) % sample_every == 0:
-            if is_main_process:
-                print(f"\nGenerating samples at step {step + 1}...")
-                samples = generate_samples(
-                    method,
-                    num_samples,
-                    image_shape,
-                    device,
-                    method_name,
-                    config,
-                    ema,
-                    current_step=step + 1,
-                )
-                sample_path = os.path.join(log_dir, 'samples', f'samples_{step + 1:07d}.png')
-                save_samples(samples, sample_path, num_samples)
-
-                # Log samples to wandb
-                if wandb_run is not None:
-                    try:
-                        # Load the saved image and log it
-                        img = PILImage.open(sample_path)
-                        wandb.log({
-                            'samples': wandb.Image(img, caption=f'Step {step + 1}')
-                        }, step=step + 1)
-                    except Exception as e:
-                        print(f"Warning: Failed to log samples to wandb: {e}")
-
-            # Barrier to synchronize all processes after sampling
-            if is_distributed:
-                dist.barrier()
-
-        # Save checkpoint
-        if save_every and (step + 1) % save_every == 0:
-            if is_main_process:
-                checkpoint_path = os.path.join(log_dir, 'checkpoints', f'{method_name}_{step + 1:07d}.pt')
-                save_checkpoint(checkpoint_path, model, optimizer, ema, scaler, step + 1, config)
-
-            # Barrier to synchronize all processes after checkpoint save
-            if is_distributed:
-                dist.barrier()
-    
-    # Save final checkpoint
-    if is_main_process:
-        final_path = os.path.join(log_dir, 'checkpoints', f'{method_name}_final.pt')
-        save_checkpoint(final_path, model, optimizer, ema, scaler, num_iterations, config)
-
-        print("\nTraining complete!")
-        print(f"Final checkpoint: {final_path}")
-        print(f"Samples saved to: {os.path.join(log_dir, 'samples')}")
-
-    # Finish wandb run
-    if is_main_process and wandb_run is not None:
-        try:
-            wandb.finish()
-        except Exception as e:
-            print(f"Warning: Failed to finish wandb run: {e}")
-
-    # Final barrier before cleanup
-    if is_distributed:
-        dist.barrier()
-        cleanup_distributed(is_distributed)
+            cleanup_distributed(is_distributed)
 
 
 
