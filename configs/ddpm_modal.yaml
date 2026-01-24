@@ -36,7 +36,7 @@ training:
   weight_decay: 0.0
   gradient_clip_norm: 1.0
   checkpoint_every: 1000
-  ema_decay: 0.9999
+  ema_decay: 0.999
   ema_start: 0
 sampling:
   num_samples: 64
