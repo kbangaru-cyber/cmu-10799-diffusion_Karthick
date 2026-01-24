@@ -30,10 +30,7 @@ class DDPM_X0(BaseMethod):
         beta_start: float = 1e-4,
         beta_end: float = 2e-2,
     ):
-        super().__init__()
-        self.model = model
-        self.device = device
-
+        super().__init__(model, device)
         self.num_timesteps = int(num_timesteps)
         self.beta_start = float(beta_start)
         self.beta_end = float(beta_end)
@@ -190,9 +187,4 @@ class DDPM_X0(BaseMethod):
                 )
 
         return x
-
-    def state_dict(self) -> Dict[str, torch.Tensor]:
-        return {"model": self.model.state_dict(), "num_timesteps": torch.tensor(self.num_timesteps)}
-
-    def load_state_dict(self, state_dict: Dict[str, torch.Tensor]):
         self.model.load_state_dict(state_dict["model"])
