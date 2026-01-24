@@ -141,13 +141,30 @@ def reduce_metrics(
 
 
 def create_optimizer(model: nn.Module, config: dict) -> torch.optim.Optimizer:
-    """Create optimizer from config."""
-    training_config = config['training']
+    """Create optimizer from config (robust to schema variations).
+
+    Supports keys:
+      training.learning_rate or training.lr
+      training.betas (list/tuple of length 2)
+      training.weight_decay
+    """
+    training_config = config.get('training', {}) or {}
+
+    lr = training_config.get('learning_rate', training_config.get('lr', 2e-4))
+    betas = training_config.get('betas', (0.9, 0.999))
+    weight_decay = training_config.get('weight_decay', 0.0)
+
+    # Normalize betas
+    if isinstance(betas, (list, tuple)) and len(betas) == 2:
+        betas = (float(betas[0]), float(betas[1]))
+    else:
+        betas = (0.9, 0.999)
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=training_config['learning_rate'],
-        betas=tuple(training_config['betas']),
-        weight_decay=training_config['weight_decay'],
+        lr=float(lr),
+        betas=betas,
+        weight_decay=float(weight_decay),
     )
     return optimizer
 
@@ -449,10 +466,10 @@ def train(
         start_step = load_checkpoint(resume_path, model, optimizer, ema, scaler, device)
     
     # Training config
-    num_iterations = training_config['num_iterations']
-    log_every = training_config['log_every']
-    sample_every = training_config['sample_every']
-    save_every = training_config['save_every']
+    num_iterations = training_config.get('num_iterations', training_config.get('max_steps', 2000))
+    log_every = training_config.get('log_every', 50)
+    sample_every = training_config.get('sample_every', training_config.get('eval_every', 200))
+    save_every = training_config.get('save_every', training_config.get('checkpoint_every', 1000))
     num_samples = training_config['num_samples']
     gradient_clip_norm = training_config['gradient_clip_norm']
     
