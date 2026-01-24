@@ -71,7 +71,18 @@ def setup_logging(config: dict, method_name: str) -> tuple[str, Any]:
 
     # Initialize wandb if enabled
     wandb_run = None
-    wandb_config = config['logging'].get('wandb', {})
+    logging_cfg = config.get('logging', {})
+    if isinstance(logging_cfg, bool) or logging_cfg is None:
+        logging_cfg = {}
+
+    wandb_config = logging_cfg.get('wandb', {})
+    # tolerate wandb: false / true
+    if isinstance(wandb_config, bool) or wandb_config is None:
+        wandb_config = {'enabled': bool(wandb_config)}
+    # also tolerate top-level wandb: ...
+    if not isinstance(wandb_config, dict):
+        wandb_config = {'enabled': False}
+
     if wandb_config.get('enabled', False):
         try:
             wandb_run = wandb.init(
