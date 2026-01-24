@@ -58,7 +58,8 @@ def load_config(config_path: str) -> dict:
 def setup_logging(config: dict, method_name: str) -> tuple[str, Any]:
     """Set up logging directories and wandb. Returns (log_dir, wandb_run)."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = os.path.join(config['logging']['dir'], f"{method_name}_{timestamp}")
+    log_root = (config.get('logging', {}) or {}).get('dir', './logs')
+    log_dir = os.path.join(log_root, f"{method_name}_{timestamp}")
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(os.path.join(log_dir, 'samples'), exist_ok=True)
     os.makedirs(os.path.join(log_dir, 'checkpoints'), exist_ok=True)
@@ -311,8 +312,8 @@ def train(
     rank, world_size, local_rank = get_distributed_context()
 
     # Check if config wants distributed training
-    config_device = config['infrastructure'].get('device', 'cuda')
-    config_num_gpus = config['infrastructure'].get('num_gpus', None)
+    config_device = (config.get('infrastructure', {}) or {}).get('device', 'cuda')
+    config_num_gpus = (config.get('infrastructure', {}) or {}).get('num_gpus', None)
 
     # Distributed only if: world_size > 1 AND config allows it
     # Config disables distributed if: device='cpu' OR num_gpus=1
@@ -360,17 +361,17 @@ def train(
                 print(f"✓ CPU training")
                 print(f"  - Device: {device}")
         print(f"  - Config device setting: {config_device}")
-        print(f"  - Mixed precision: {config['infrastructure'].get('mixed_precision', False)}")
+        print(f"  - Mixed precision: {(config.get('infrastructure', {}) or {}).get('mixed_precision', False)}")
         print("=" * 60)
 
     # Set seed for reproducibility
-    seed = config['infrastructure']['seed']
+    seed = (config.get('infrastructure', {}) or {}).get('seed', 42)
     torch.manual_seed(seed)  # Same seed for all ranks for model init
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
 
-    training_config = config['training']
-    data_config = config['data']
+    training_config = config.get('training', {}) or {}
+    data_config = config.get('data', {}) or {}
 
     # Create data loader
     if is_main_process:
@@ -387,10 +388,10 @@ def train(
         )
         dataloader = DataLoader(
             dataloader.dataset,
-            batch_size=training_config['batch_size'],
+            batch_size=int(training_config.get('batch_size', 64)),
             sampler=sampler,
-            num_workers=data_config['num_workers'],
-            pin_memory=data_config['pin_memory'],
+            num_workers=int(data_config.get('num_workers', 4)),
+            pin_memory=bool(data_config.get('pin_memory', True)),
             drop_last=True,
         )
 
@@ -440,12 +441,14 @@ def train(
     optimizer = create_optimizer(model, config) # default to AdamW optimizer
 
     # Create EMA
-    ema = EMA(unwrap_model(model), decay=config['training']['ema_decay'])
+    ema_decay = float(training_config.get('ema_decay', 0.9999))
+    ema = EMA(unwrap_model(model), decay=ema_decay)
 
     # Create gradient scaler for mixed precision
     # Determine device type for GradScaler (cuda or cpu)
     device_type = 'cuda' if device.type == 'cuda' else 'cpu'
-    scaler = GradScaler(device_type, enabled=config['infrastructure']['mixed_precision'])
+    mp_enabled = bool((config.get('infrastructure', {}) or {}).get('mixed_precision', False))
+    scaler = GradScaler(device_type, enabled=mp_enabled)
 
     # Setup logging
     log_dir = None
@@ -481,11 +484,13 @@ def train(
     log_every = training_config.get('log_every', 50)
     sample_every = training_config.get('sample_every', training_config.get('eval_every', 200))
     save_every = training_config.get('save_every', training_config.get('checkpoint_every', 1000))
-    num_samples = training_config['num_samples']
-    gradient_clip_norm = training_config['gradient_clip_norm']
+    num_samples = int(training_config.get('num_samples', (config.get('sampling', {}) or {}).get('num_samples', 64)))
+    gradient_clip_norm = float(training_config.get('gradient_clip_norm', 1.0))
     
     # Image shape for sampling
-    image_shape = (data_config['channels'], data_config['image_size'], data_config['image_size'])
+    channels = int(data_config.get('channels', 3))
+    image_size = int(data_config.get('image_size', 64))
+    image_shape = (channels, image_size, image_size)
     
     # Training loop
     if is_main_process:
@@ -514,7 +519,7 @@ def train(
 
         # Replicate to match desired batch size
         base_batch_size = single_batch_base.shape[0]
-        desired_batch_size = training_config['batch_size']
+        desired_batch_size = int(training_config.get('batch_size', single_batch_base.shape[0]))
 
         if desired_batch_size > base_batch_size:
             # Replicate the batch to reach desired size
@@ -561,7 +566,7 @@ def train(
         # Forward pass with mixed precision
         optimizer.zero_grad()
         
-        with autocast(device_type, enabled=config['infrastructure']['mixed_precision']):
+        with autocast(device_type, enabled=mp_enabled):
             loss, metrics = method.compute_loss(batch)
         
         # Backward pass
@@ -710,6 +715,9 @@ def main():
 
     # Override with resume path if specified
     if args.resume:
+        config.setdefault('checkpoint', {})
+        if isinstance(config.get('checkpoint', None), bool) or config.get('checkpoint', None) is None:
+            config['checkpoint'] = {}
         config['checkpoint']['resume'] = args.resume
 
     # Train
