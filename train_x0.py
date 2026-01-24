@@ -58,8 +58,7 @@ def load_config(config_path: str) -> dict:
 def setup_logging(config: dict, method_name: str) -> tuple[str, Any]:
     """Set up logging directories and wandb. Returns (log_dir, wandb_run)."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_root = (config.get('logging', {}) or {}).get('dir', './logs')
-    log_dir = os.path.join(log_root, f"{method_name}_{timestamp}")
+    log_dir = os.path.join(config['logging']['dir'], f"{method_name}_{timestamp}")
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(os.path.join(log_dir, 'samples'), exist_ok=True)
     os.makedirs(os.path.join(log_dir, 'checkpoints'), exist_ok=True)
@@ -72,18 +71,7 @@ def setup_logging(config: dict, method_name: str) -> tuple[str, Any]:
 
     # Initialize wandb if enabled
     wandb_run = None
-    logging_cfg = config.get('logging', {})
-    if isinstance(logging_cfg, bool) or logging_cfg is None:
-        logging_cfg = {}
-
-    wandb_config = logging_cfg.get('wandb', {})
-    # tolerate wandb: false / true
-    if isinstance(wandb_config, bool) or wandb_config is None:
-        wandb_config = {'enabled': bool(wandb_config)}
-    # also tolerate top-level wandb: ...
-    if not isinstance(wandb_config, dict):
-        wandb_config = {'enabled': False}
-
+    wandb_config = config['logging'].get('wandb', {})
     if wandb_config.get('enabled', False):
         try:
             wandb_run = wandb.init(
@@ -153,30 +141,13 @@ def reduce_metrics(
 
 
 def create_optimizer(model: nn.Module, config: dict) -> torch.optim.Optimizer:
-    """Create optimizer from config (robust to schema variations).
-
-    Supports keys:
-      training.learning_rate or training.lr
-      training.betas (list/tuple of length 2)
-      training.weight_decay
-    """
-    training_config = config.get('training', {}) or {}
-
-    lr = training_config.get('learning_rate', training_config.get('lr', 2e-4))
-    betas = training_config.get('betas', (0.9, 0.999))
-    weight_decay = training_config.get('weight_decay', 0.0)
-
-    # Normalize betas
-    if isinstance(betas, (list, tuple)) and len(betas) == 2:
-        betas = (float(betas[0]), float(betas[1]))
-    else:
-        betas = (0.9, 0.999)
-
+    """Create optimizer from config."""
+    training_config = config['training']
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=float(lr),
-        betas=betas,
-        weight_decay=float(weight_decay),
+        lr=training_config['learning_rate'],
+        betas=tuple(training_config['betas']),
+        weight_decay=training_config['weight_decay'],
     )
     return optimizer
 
@@ -235,39 +206,34 @@ def generate_samples(
     config: dict,
     ema: Optional[EMA] = None,
     current_step: Optional[int] = None,
-    # TODO: add/delete your arguments here
     **sampling_kwargs,
 ) -> torch.Tensor:
-    """
-    Generate samples using EMA parameters if available.
-
-    TODO: incoporate your own sampling scheme here
-
-    Args:
-        method: The diffusion method object (e.g., DDPM) with sample() and eval/train mode methods.
-        num_samples: Number of samples to generate.
-        image_shape: Shape of each image as (channels, height, width).
-        device: The torch device to generate samples on.
-        method_name: Name of the method being used (e.g., 'ddpm').
-        config: Configuration dictionary containing training and model settings.
-        ema: Optional EMA wrapper for the model. If provided and conditions are met,
-            EMA parameters will be used during sampling.
-        current_step: Current training step. Used to determine if EMA should be applied
-            based on ema_start config.
-        **sampling_kwargs: Additional keyword arguments passed to method.sample().
-
-    Returns:
-        torch.Tensor: Generated samples with shape (num_samples, *image_shape).
-    """
+    """Generate samples (optionally using EMA weights)."""
     method.eval_mode()
 
-    ema_start = config.get('training', {}).get('ema_start', 0)
-    use_ema = ema is not None and (current_step is None or current_step >= ema_start)
+    training_cfg = config.get("training", {}) or {}
+    sampling_cfg = config.get("sampling", {}) or {}
+    ddpm_cfg = config.get("ddpm", {}) or {}
+
+    # Prefer sampling.num_steps, else fall back to ddpm.num_timesteps
+    num_steps = sampling_cfg.get("num_steps", ddpm_cfg.get("num_timesteps", 1000))
+    try:
+        num_steps = int(num_steps)
+    except Exception:
+        num_steps = 1000
+
+    ema_start = int(training_cfg.get("ema_start", 0))
+    use_ema = ema is not None and (current_step is None or int(current_step) >= ema_start)
     if use_ema:
         ema.apply_shadow()
 
-    samples = None
-    # TODO: sample with your method.sample()
+    try:
+        samples = method.sample(batch_size=num_samples, image_shape=image_shape, num_steps=num_steps, **sampling_kwargs)
+    except TypeError:
+        samples = method.sample(num_samples, image_shape, num_steps)
+
+    if samples is None:
+        raise ValueError("generate_samples got samples=None. Implement method.sample() to return a tensor.")
 
     if use_ema:
         ema.restore()
@@ -281,16 +247,11 @@ def save_samples(
     save_path: str,
     num_samples: int,
 ) -> None:
-    """
-    TODO: save generated samples as images.
-
-    Args:
-        samples: Generated samples tensor with shape (num_samples, C, H, W).
-        save_path: File path to save the image grid.
-        num_samples: Number of samples, used to calculate grid layout.
-    """
-
-    raise NotImplementedError
+    """Save a grid of generated samples to disk."""
+    samples = samples.detach().cpu()
+    samples = unnormalize(samples).clamp(0.0, 1.0)
+    nrow = max(1, int(math.sqrt(num_samples)))
+    save_image(samples, save_path, nrow=nrow)
 
 
 def train(
@@ -312,8 +273,8 @@ def train(
     rank, world_size, local_rank = get_distributed_context()
 
     # Check if config wants distributed training
-    config_device = (config.get('infrastructure', {}) or {}).get('device', 'cuda')
-    config_num_gpus = (config.get('infrastructure', {}) or {}).get('num_gpus', None)
+    config_device = config['infrastructure'].get('device', 'cuda')
+    config_num_gpus = config['infrastructure'].get('num_gpus', None)
 
     # Distributed only if: world_size > 1 AND config allows it
     # Config disables distributed if: device='cpu' OR num_gpus=1
@@ -361,17 +322,17 @@ def train(
                 print(f"✓ CPU training")
                 print(f"  - Device: {device}")
         print(f"  - Config device setting: {config_device}")
-        print(f"  - Mixed precision: {(config.get('infrastructure', {}) or {}).get('mixed_precision', False)}")
+        print(f"  - Mixed precision: {config['infrastructure'].get('mixed_precision', False)}")
         print("=" * 60)
 
     # Set seed for reproducibility
-    seed = (config.get('infrastructure', {}) or {}).get('seed', 42)
+    seed = config['infrastructure']['seed']
     torch.manual_seed(seed)  # Same seed for all ranks for model init
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
 
-    training_config = config.get('training', {}) or {}
-    data_config = config.get('data', {}) or {}
+    training_config = config['training']
+    data_config = config['data']
 
     # Create data loader
     if is_main_process:
@@ -388,10 +349,10 @@ def train(
         )
         dataloader = DataLoader(
             dataloader.dataset,
-            batch_size=int(training_config.get('batch_size', 64)),
+            batch_size=training_config['batch_size'],
             sampler=sampler,
-            num_workers=int(data_config.get('num_workers', 4)),
-            pin_memory=bool(data_config.get('pin_memory', True)),
+            num_workers=data_config['num_workers'],
+            pin_memory=data_config['pin_memory'],
             drop_last=True,
         )
 
@@ -441,14 +402,12 @@ def train(
     optimizer = create_optimizer(model, config) # default to AdamW optimizer
 
     # Create EMA
-    ema_decay = float(training_config.get('ema_decay', 0.9999))
-    ema = EMA(unwrap_model(model), decay=ema_decay)
+    ema = EMA(unwrap_model(model), decay=config['training']['ema_decay'])
 
     # Create gradient scaler for mixed precision
     # Determine device type for GradScaler (cuda or cpu)
     device_type = 'cuda' if device.type == 'cuda' else 'cpu'
-    mp_enabled = bool((config.get('infrastructure', {}) or {}).get('mixed_precision', False))
-    scaler = GradScaler(device_type, enabled=mp_enabled)
+    scaler = GradScaler(device_type, enabled=config['infrastructure']['mixed_precision'])
 
     # Setup logging
     log_dir = None
@@ -480,17 +439,15 @@ def train(
         start_step = load_checkpoint(resume_path, model, optimizer, ema, scaler, device)
     
     # Training config
-    num_iterations = training_config.get('num_iterations', training_config.get('max_steps', 2000))
-    log_every = training_config.get('log_every', 50)
-    sample_every = training_config.get('sample_every', training_config.get('eval_every', 200))
-    save_every = training_config.get('save_every', training_config.get('checkpoint_every', 1000))
-    num_samples = int(training_config.get('num_samples', (config.get('sampling', {}) or {}).get('num_samples', 64)))
-    gradient_clip_norm = float(training_config.get('gradient_clip_norm', 1.0))
+    num_iterations = training_config['num_iterations']
+    log_every = training_config['log_every']
+    sample_every = training_config['sample_every']
+    save_every = training_config['save_every']
+    num_samples = training_config['num_samples']
+    gradient_clip_norm = training_config['gradient_clip_norm']
     
     # Image shape for sampling
-    channels = int(data_config.get('channels', 3))
-    image_size = int(data_config.get('image_size', 64))
-    image_shape = (channels, image_size, image_size)
+    image_shape = (data_config['channels'], data_config['image_size'], data_config['image_size'])
     
     # Training loop
     if is_main_process:
@@ -519,7 +476,7 @@ def train(
 
         # Replicate to match desired batch size
         base_batch_size = single_batch_base.shape[0]
-        desired_batch_size = int(training_config.get('batch_size', single_batch_base.shape[0]))
+        desired_batch_size = training_config['batch_size']
 
         if desired_batch_size > base_batch_size:
             # Replicate the batch to reach desired size
@@ -566,7 +523,7 @@ def train(
         # Forward pass with mixed precision
         optimizer.zero_grad()
         
-        with autocast(device_type, enabled=mp_enabled):
+        with autocast(device_type, enabled=config['infrastructure']['mixed_precision']):
             loss, metrics = method.compute_loss(batch)
         
         # Backward pass
@@ -715,9 +672,6 @@ def main():
 
     # Override with resume path if specified
     if args.resume:
-        config.setdefault('checkpoint', {})
-        if isinstance(config.get('checkpoint', None), bool) or config.get('checkpoint', None) is None:
-            config['checkpoint'] = {}
         config['checkpoint']['resume'] = args.resume
 
     # Train
