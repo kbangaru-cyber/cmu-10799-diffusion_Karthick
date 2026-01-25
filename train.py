@@ -1,13 +1,17 @@
-""" 
+"""
 Training Script for DDPM (Denoising Diffusion Probabilistic Models)
 
-This is a config-tolerant training script (won't crash on missing YAML keys).
+Config-tolerant training script (won't crash on missing YAML keys).
 It supports:
 - Mixed precision (AMP)
 - EMA (exponential moving average)
 - Gradient clipping
 - Periodic checkpoints + sampling
 - Optional torchrun DistributedDataParallel
+
+NEW:
+- Writes per-step loss to CSV:   <log_dir>/train_loss.csv
+- Writes log_every metrics to CSV: <log_dir>/train_metrics.csv
 
 Usage:
   python train.py --method ddpm --config configs/ddpm_modal.yaml
@@ -19,6 +23,8 @@ import os
 import argparse
 import math
 import time
+import csv
+import json
 from datetime import datetime
 from typing import Optional, Dict, Any, Tuple
 
@@ -218,7 +224,6 @@ def generate_samples(
     num_steps = sampling_kwargs.get("num_steps", sampling_cfg.get("num_steps", getattr(method, "num_timesteps", 1000)))
     eta = sampling_kwargs.get("eta", sampling_cfg.get("eta", 0.0))
 
-    # Preferred signature (what our HW code usually expects)
     try:
         samples = method.sample(
             batch_size=num_samples,
@@ -227,7 +232,6 @@ def generate_samples(
             eta=eta,
         )
     except TypeError:
-        # Fallback for older positional signature
         samples = method.sample(num_samples, image_shape, num_steps)
 
     if samples is None:
@@ -242,7 +246,6 @@ def generate_samples(
 
 def save_samples(samples: torch.Tensor, save_path: str, num_samples: int) -> None:
     samples = samples.detach().cpu()
-    # samples are typically in [-1, 1]; map to [0, 1]
     samples = unnormalize(samples).clamp(0.0, 1.0)
     nrow = max(1, int(math.sqrt(num_samples)))
     save_image(samples, save_path, nrow=nrow)
@@ -357,7 +360,6 @@ def train(method_name: str, config: dict, resume_path: Optional[str] = None, ove
             beta_end=float(ddpm_cfg.get("beta_end", 2e-2)),
         )
 
-    # Ensure buffers on device if method provides .to
     if hasattr(method, "to"):
         method = method.to(device)
 
@@ -373,6 +375,34 @@ def train(method_name: str, config: dict, resume_path: Optional[str] = None, ove
     log_dir, wandb_run = (None, None)
     if is_main:
         log_dir, wandb_run = setup_logging(config, method_name)
+
+    # Create CSV loggers (main process only)
+    loss_csv_path = None
+    metrics_csv_path = None
+    loss_csv_f = None
+    metrics_csv_f = None
+    loss_writer = None
+    metrics_writer = None
+
+    if is_main:
+        loss_csv_path = os.path.join(log_dir, "train_loss.csv")
+        metrics_csv_path = os.path.join(log_dir, "train_metrics.csv")
+
+        loss_csv_f = open(loss_csv_path, "w", newline="")
+        metrics_csv_f = open(metrics_csv_path, "w", newline="")
+
+        loss_writer = csv.DictWriter(loss_csv_f, fieldnames=["step", "epoch", "loss"])
+        loss_writer.writeheader()
+
+        metrics_writer = csv.DictWriter(
+            metrics_csv_f,
+            fieldnames=["step", "epoch", "loss", "steps_per_sec", "lr", "metrics_json"],
+        )
+        metrics_writer.writeheader()
+
+        # Make sure headers are on disk immediately
+        loss_csv_f.flush()
+        metrics_csv_f.flush()
 
     # Resume
     start_step = 0
@@ -432,96 +462,139 @@ def train(method_name: str, config: dict, resume_path: Optional[str] = None, ove
     metrics_count = 0
     t0 = time.time()
 
+    # Flush CSVs periodically to reduce data loss if interrupted
+    csv_flush_every = int(training_cfg.get("csv_flush_every", 200))
+
     pbar = tqdm(range(start_step, num_iterations), initial=start_step, total=num_iterations, disable=not is_main)
-    for step in pbar:
-        # Batch
-        if overfit_single_batch:
-            batch = single_batch
-        else:
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                epoch += 1
-                if sampler is not None:
-                    sampler.set_epoch(epoch)
-                data_iter = iter(dataloader)
-                batch = next(data_iter)
-
-            if isinstance(batch, (tuple, list)):
-                batch = batch[0]
-            batch = batch.to(device)
-
-        optimizer.zero_grad(set_to_none=True)
-
-        with autocast(device_type, enabled=mixed_precision):
-            loss, metrics = method.compute_loss(batch)
-
-        scaler.scale(loss).backward()
-
-        if grad_clip and grad_clip > 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
-        scaler.step(optimizer)
-        scaler.update()
-
-        ema.update()
-
-        for k, v in metrics.items():
-            metrics_sum.setdefault(k, []).append(v.detach().item() if torch.is_tensor(v) else float(v))
-        metrics_count += 1
-
-        # Console + wandb log
-        if log_every and (step + 1) % log_every == 0:
-            elapsed = time.time() - t0
-            steps_per_sec = metrics_count / max(1e-9, elapsed)
-            local_avg = {k: sum(v) / len(v) for k, v in metrics_sum.items()}
-            avg = reduce_metrics(local_avg, device, world_size)
-
-            if is_main:
-                pbar.set_postfix({
-                    "loss": f"{avg.get('loss', float(loss.detach().item())):.4f}",
-                    "steps/s": f"{steps_per_sec:.2f}",
-                })
-
-            if is_main and wandb_run is not None and wandb is not None:
-                log_dict = {"train/step": step + 1, "train/steps_per_sec": steps_per_sec, "train/lr": optimizer.param_groups[0]["lr"]}
-                for k, v in avg.items():
-                    log_dict[f"train/{k}"] = v
+    try:
+        for step in pbar:
+            # Batch
+            if overfit_single_batch:
+                batch = single_batch
+            else:
                 try:
-                    wandb.log(log_dict, step=step + 1)
-                except Exception as e:
-                    print(f"Warning: wandb.log failed: {e}")
+                    batch = next(data_iter)
+                except StopIteration:
+                    epoch += 1
+                    if sampler is not None:
+                        sampler.set_epoch(epoch)
+                    data_iter = iter(dataloader)
+                    batch = next(data_iter)
 
-            metrics_sum = {}
-            metrics_count = 0
-            t0 = time.time()
+                if isinstance(batch, (tuple, list)):
+                    batch = batch[0]
+                batch = batch.to(device)
 
-        # Sampling
-        if sample_every and (step + 1) % sample_every == 0:
-            if is_main:
-                print(f"\nGenerating samples at step {step + 1}...")
-                samples = generate_samples(method, num_samples, image_shape, config, ema=ema, current_step=step + 1)
-                sample_path = os.path.join(log_dir, "samples", f"samples_{step + 1:07d}.png")
-                save_samples(samples, sample_path, num_samples)
+            optimizer.zero_grad(set_to_none=True)
 
-                if wandb_run is not None and wandb is not None and PILImage is not None:
+            with autocast(device_type, enabled=mixed_precision):
+                loss, metrics = method.compute_loss(batch)
+
+            # Per-step loss CSV (main only)
+            if is_main and loss_writer is not None:
+                loss_val = float(loss.detach().item())
+                loss_writer.writerow({"step": step + 1, "epoch": epoch, "loss": loss_val})
+
+            scaler.scale(loss).backward()
+
+            if grad_clip and grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+            scaler.step(optimizer)
+            scaler.update()
+
+            ema.update()
+
+            for k, v in metrics.items():
+                metrics_sum.setdefault(k, []).append(v.detach().item() if torch.is_tensor(v) else float(v))
+            metrics_count += 1
+
+            # Console + wandb log
+            if log_every and (step + 1) % log_every == 0:
+                elapsed = time.time() - t0
+                steps_per_sec = metrics_count / max(1e-9, elapsed)
+                local_avg = {k: sum(v) / len(v) for k, v in metrics_sum.items()}
+                avg = reduce_metrics(local_avg, device, world_size)
+
+                avg_loss = avg.get("loss", float(loss.detach().item()))
+
+                if is_main:
+                    pbar.set_postfix({
+                        "loss": f"{avg_loss:.4f}",
+                        "steps/s": f"{steps_per_sec:.2f}",
+                    })
+
+                # metrics CSV (main only)
+                if is_main and metrics_writer is not None:
+                    metrics_writer.writerow({
+                        "step": step + 1,
+                        "epoch": epoch,
+                        "loss": float(avg_loss),
+                        "steps_per_sec": float(steps_per_sec),
+                        "lr": float(optimizer.param_groups[0]["lr"]),
+                        "metrics_json": json.dumps(avg),
+                    })
+
+                if is_main and wandb_run is not None and wandb is not None:
+                    log_dict = {
+                        "train/step": step + 1,
+                        "train/steps_per_sec": steps_per_sec,
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                    }
+                    for k, v in avg.items():
+                        log_dict[f"train/{k}"] = v
                     try:
-                        img = PILImage.open(sample_path)
-                        wandb.log({"samples": wandb.Image(img, caption=f"Step {step + 1}")}, step=step + 1)
+                        wandb.log(log_dict, step=step + 1)
                     except Exception as e:
-                        print(f"Warning: wandb image log failed: {e}")
+                        print(f"Warning: wandb.log failed: {e}")
 
-            if is_distributed:
-                dist.barrier()
+                metrics_sum = {}
+                metrics_count = 0
+                t0 = time.time()
 
-        # Checkpoint
-        if save_every and (step + 1) % save_every == 0:
-            if is_main:
-                ckpt_path = os.path.join(log_dir, "checkpoints", f"{method_name}_{step + 1:07d}.pt")
-                save_checkpoint(ckpt_path, model, optimizer, ema, scaler, step + 1, config)
-            if is_distributed:
-                dist.barrier()
+            # Periodic flush (so Ctrl+C still leaves you logs)
+            if is_main and (step + 1) % csv_flush_every == 0:
+                if loss_csv_f is not None:
+                    loss_csv_f.flush()
+                if metrics_csv_f is not None:
+                    metrics_csv_f.flush()
+
+            # Sampling
+            if sample_every and (step + 1) % sample_every == 0:
+                if is_main:
+                    print(f"\nGenerating samples at step {step + 1}...")
+                    samples = generate_samples(method, num_samples, image_shape, config, ema=ema, current_step=step + 1)
+                    sample_path = os.path.join(log_dir, "samples", f"samples_{step + 1:07d}.png")
+                    save_samples(samples, sample_path, num_samples)
+
+                    if wandb_run is not None and wandb is not None and PILImage is not None:
+                        try:
+                            img = PILImage.open(sample_path)
+                            wandb.log({"samples": wandb.Image(img, caption=f"Step {step + 1}")}, step=step + 1)
+                        except Exception as e:
+                            print(f"Warning: wandb image log failed: {e}")
+
+                if is_distributed:
+                    dist.barrier()
+
+            # Checkpoint
+            if save_every and (step + 1) % save_every == 0:
+                if is_main:
+                    ckpt_path = os.path.join(log_dir, "checkpoints", f"{method_name}_{step + 1:07d}.pt")
+                    save_checkpoint(ckpt_path, model, optimizer, ema, scaler, step + 1, config)
+                if is_distributed:
+                    dist.barrier()
+
+    finally:
+        # Flush + close CSV files safely
+        if is_main:
+            if loss_csv_f is not None:
+                loss_csv_f.flush()
+                loss_csv_f.close()
+            if metrics_csv_f is not None:
+                metrics_csv_f.flush()
+                metrics_csv_f.close()
 
     # Final checkpoint
     if is_main:
@@ -530,6 +603,8 @@ def train(method_name: str, config: dict, resume_path: Optional[str] = None, ove
         print("\nTraining complete!")
         print(f"Final checkpoint: {final_path}")
         print(f"Samples saved to: {os.path.join(log_dir, 'samples')}")
+        print(f"Loss CSV: {os.path.join(log_dir, 'train_loss.csv')}")
+        print(f"Metrics CSV: {os.path.join(log_dir, 'train_metrics.csv')}")
 
     if is_main and wandb_run is not None and wandb is not None:
         try:
