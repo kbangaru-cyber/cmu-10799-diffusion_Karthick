@@ -39,7 +39,7 @@ from tqdm import tqdm
 
 from src.models import create_model_from_config
 from src.data import create_dataloader_from_config, save_image, unnormalize
-from src.methods import DDPM
+from src.methods import DDPM, FlowMatching
 from src.utils import EMA
 
 # Optional deps
@@ -345,20 +345,32 @@ def train(method_name: str, config: dict, resume_path: Optional[str] = None, ove
     if is_main:
         print(f"Creating {method_name}...")
 
-    if method_name != "ddpm":
-        raise ValueError(f"Unknown method: {method_name}. Only 'ddpm' is supported.")
+    if method_name == "ddpm":
+        if hasattr(DDPM, "from_config"):
+            method = DDPM.from_config(model, config, device)
+        else:
+            ddpm_cfg = config.get("ddpm", {}) or {}
+            method = DDPM(
+                model=model,
+                device=device,
+                num_timesteps=int(ddpm_cfg.get("num_timesteps", 1000)),
+                beta_start=float(ddpm_cfg.get("beta_start", 1e-4)),
+                beta_end=float(ddpm_cfg.get("beta_end", 2e-2)),
+            )
 
-    if hasattr(DDPM, "from_config"):
-        method = DDPM.from_config(model, config, device)
+    elif method_name == "flow_matching":
+        if hasattr(FlowMatching, "from_config"):
+            method = FlowMatching.from_config(model, config, device)
+        else:
+            flow_matching_cfg = config.get("flow_matching", {}) or {}
+            method = FlowMatching(
+                model=model,
+                device=device,
+                num_timesteps=int(flow_matching_cfg.get("num_timesteps", 1000)),
+            )
+
     else:
-        ddpm_cfg = config.get("ddpm", {}) or {}
-        method = DDPM(
-            model=model,
-            device=device,
-            num_timesteps=int(ddpm_cfg.get("num_timesteps", 1000)),
-            beta_start=float(ddpm_cfg.get("beta_start", 1e-4)),
-            beta_end=float(ddpm_cfg.get("beta_end", 2e-2)),
-        )
+        raise ValueError(f"Unknown method: {method_name}. Supported: 'ddpm', 'flow_matching'.")
 
     if hasattr(method, "to"):
         method = method.to(device)
@@ -619,10 +631,12 @@ def train(method_name: str, config: dict, resume_path: Optional[str] = None, ove
 
 def main():
     parser = argparse.ArgumentParser(description="Train diffusion models")
-    parser.add_argument("--method", type=str, required=True, choices=["ddpm"], help="Method to train")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
     parser.add_argument("--resume", type=str, default=None, help="Checkpoint path")
     parser.add_argument("--overfit-single-batch", action="store_true", help="Overfit to one batch for debugging")
+    parser.add_argument("--method", type=str, required=True,
+                      choices=["ddpm", "flow_matching"],
+                      help="Method to train")
     args = parser.parse_args()
 
     config = load_config(args.config)
