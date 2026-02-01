@@ -15,6 +15,9 @@ Usage:
 
     # Save individual images to custom directory
     python sample.py --checkpoint checkpoints/ddpm_final.pt --method ddpm --output_dir my_samples
+
+    # Sample from Flow Matching (Euler steps)
+    python sample.py --checkpoint checkpoints/flow_matching_final.pt --method flow_matching --num_steps 200 --grid
 """
 
 import os
@@ -26,7 +29,7 @@ from tqdm import tqdm
 
 from src.models import create_model_from_config
 from src.data import save_image, unnormalize
-from src.methods import DDPM
+from src.methods import DDPM, FlowMatching
 from src.utils import EMA
 
 
@@ -57,10 +60,18 @@ def _get_image_shape_from_config(config: dict) -> tuple[int, int, int]:
 def _get_default_num_steps(config: dict) -> int:
     sampling_cfg = config.get("sampling", {}) or {}
     ddpm_cfg = config.get("ddpm", {}) or {}
+    flow_matching_cfg = config.get("flow_matching", {}) or {}
 
     steps = sampling_cfg.get("num_steps") or sampling_cfg.get("steps")
     if steps is None:
-        steps = ddpm_cfg.get("num_timesteps") or ddpm_cfg.get("timesteps") or 1000
+        # Prefer ddpm timesteps if present; else flow_matching timesteps; else 1000
+        steps = (
+            ddpm_cfg.get("num_timesteps")
+            or ddpm_cfg.get("timesteps")
+            or flow_matching_cfg.get("num_timesteps")
+            or flow_matching_cfg.get("timesteps")
+            or 1000
+        )
     return int(steps)
 
 
@@ -101,8 +112,8 @@ def main():
         "--method",
         type=str,
         required=True,
-        choices=["ddpm"],
-        help="Method used for training (currently only ddpm is supported)",
+        choices=["ddpm", "flow_matching"],
+        help="Method used for training",
     )
     parser.add_argument("--num_samples", type=int, default=64, help="Number of samples to generate")
     parser.add_argument("--output_dir", type=str, default="samples", help="Directory to save individual images")
@@ -116,6 +127,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for generation")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--num_steps", type=int, default=None, help="Number of reverse sampling steps")
+    parser.add_argument("--eta", type=float, default=None, help="DDIM stochasticity (ddpm only; eta=0 is deterministic)")
     parser.add_argument("--no_ema", action="store_true", help="Use training weights instead of EMA weights")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use (cuda/cpu)")
 
@@ -146,6 +158,20 @@ def main():
             )
         if hasattr(method, "to"):
             method = method.to(device)
+
+    elif args.method == "flow_matching":
+        if hasattr(FlowMatching, "from_config"):
+            method = FlowMatching.from_config(model, config, device)
+        else:
+            flow_matching_cfg = config.get("flow_matching", {}) or {}
+            method = FlowMatching(
+                model=model,
+                device=device,
+                num_timesteps=int(flow_matching_cfg.get("num_timesteps", 1000)),
+            )
+        if hasattr(method, "to"):
+            method = method.to(device)
+
     else:
         raise ValueError(f"Unknown method: {args.method}")
 
@@ -165,7 +191,8 @@ def main():
     print(f"Default num_steps from config: {default_steps}")
 
     num_steps = int(args.num_steps) if args.num_steps is not None else default_steps
-    print(f"Generating {args.num_samples} samples with num_steps={num_steps}...")
+    eta = args.eta if args.eta is not None else (config.get("sampling", {}) or {}).get("eta", 0.0)
+    print(f"Generating {args.num_samples} samples with num_steps={num_steps}, eta={eta}...")
 
     all_samples = []
     remaining = args.num_samples
@@ -178,7 +205,11 @@ def main():
         pbar = tqdm(total=args.num_samples, desc="Generating samples")
         while remaining > 0:
             bs = min(args.batch_size, remaining)
-            samples = method.sample(batch_size=bs, image_shape=image_shape, num_steps=num_steps)
+
+            try:
+                samples = method.sample(batch_size=bs, image_shape=image_shape, num_steps=num_steps, eta=eta)
+            except TypeError:
+                samples = method.sample(batch_size=bs, image_shape=image_shape, num_steps=num_steps)
 
             if args.grid:
                 all_samples.append(samples)
