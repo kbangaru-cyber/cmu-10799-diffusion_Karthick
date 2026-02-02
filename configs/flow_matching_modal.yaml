@@ -31,11 +31,11 @@ training:
   learning_rate: 0.0002
   betas: [0.9, 0.999]
   log_every: 50
-  sample_every: 200
-  save_every: 200
+  sample_every: 2500
+  save_every: 2500
   weight_decay: 0.0
   gradient_clip_norm: 1.0
-  checkpoint_every: 1000
+  checkpoint_every: 2500
   ema_decay: 0.999
   ema_start: 0
 sampling:
