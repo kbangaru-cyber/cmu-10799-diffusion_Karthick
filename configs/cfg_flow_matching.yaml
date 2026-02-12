@@ -1,0 +1,71 @@
+data:
+  dataset: celeba
+  image_size: 64
+  channels: 3
+  num_workers: 4
+  pin_memory: true
+  cache_dir: /data/celeba
+  hf_repo: electronickale/cmu-10799-celeba64-subset
+  from_hub: false
+  root: ./data/celeba-subset
+
+model:
+  in_channels: 3
+  out_channels: 3
+  base_channels: 128
+  channel_mult: [1, 2, 2, 4]
+  num_res_blocks: 2
+  attention_resolutions: [16, 8]
+  num_heads: 4
+  dropout: 0.1
+  use_scale_shift_norm: true
+
+# ---- Conditioning config ----
+conditioning:
+  num_attributes: 3
+  attributes:
+    - Smiling
+    - Eyeglasses
+    - Male
+
+# ---- Flow Matching config ----
+flow_matching:
+  num_timesteps: 1000
+
+# ---- Classifier-Free Guidance config ----
+cfg:
+  p_uncond: 0.1          # probability of dropping condition during training
+  guidance_scale: 2.0    # default guidance scale for sampling
+
+# ---- Training config ----
+training:
+  num_iterations: 5000
+  batch_size: 64
+  learning_rate: 0.0002
+  betas: [0.9, 0.999]
+  weight_decay: 0.0
+  gradient_clip_norm: 1.0
+  ema_decay: 0.999
+  ema_start: 0
+  log_every: 50
+  sample_every: 2500
+  save_every: 2500
+  num_samples: 32
+
+# ---- Sampling config ----
+sampling:
+  num_samples: 64
+  num_steps: 200
+  guidance_scale: 2.0
+
+# ---- Infrastructure ----
+infrastructure:
+  seed: 42
+  device: cuda
+  mixed_precision: false
+
+# ---- Logging ----
+logging:
+  dir: ./logs
+  wandb:
+    enabled: false
