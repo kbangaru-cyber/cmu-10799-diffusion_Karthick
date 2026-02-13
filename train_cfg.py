@@ -1,21 +1,3 @@
-"""
-Training Script for CFG Flow Matching (Conditional)
-
-Trains a conditional flow matching model with classifier-free guidance on
-CelebA 64×64 with binary attribute labels.
-
-Key differences from the base train.py:
-  - Uses CondUNet instead of UNet (accepts attribute vector c)
-  - Uses CelebAWithAttributes dataset (returns image + attributes)
-  - Passes attributes to method.compute_loss(batch, c=attrs)
-  - Condition dropout (p_uncond) is handled inside CFGFlowMatching
-
-Usage:
-  python train_cfg.py --config configs/cfg_flow_matching.yaml
-  python train_cfg.py --config configs/cfg_flow_matching.yaml --overfit-single-batch
-  python train_cfg.py --config configs/cfg_flow_matching.yaml --resume logs/.../checkpoints/cfg_fm_XXXX.pt
-"""
-
 import os
 import argparse
 import math
