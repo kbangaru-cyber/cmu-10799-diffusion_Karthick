@@ -57,19 +57,33 @@ def _get_image_shape_from_config(config):
     H = int(data_cfg.get("image_size", model_cfg.get("image_size", 64)))
     return (C, H, H)
 
-
 def load_checkpoint(checkpoint_path, device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     config = checkpoint["config"]
 
     model = create_cond_model_from_config(config).to(device)
-    model.load_state_dict(checkpoint["model"], strict=True)
+    
+    # Fix for torch.compile: strip "_orig_mod." prefix from state dict keys
+    state_dict = checkpoint["model"]
+    cleaned = {}
+    for k, v in state_dict.items():
+        new_key = k.replace("_orig_mod.", "")
+        cleaned[new_key] = v
+    
+    model.load_state_dict(cleaned, strict=True)
 
     ema = None
     if "ema" in checkpoint:
         decay = (config.get("training", {}) or {}).get("ema_decay", 0.9999)
         ema = EMA(model, decay=decay)
-        ema.load_state_dict(checkpoint["ema"])
+        # Also strip prefix from EMA shadow keys
+        ema_state = checkpoint["ema"]
+        if "shadow" in ema_state:
+            ema_state["shadow"] = {
+                k.replace("_orig_mod.", ""): v 
+                for k, v in ema_state["shadow"].items()
+            }
+        ema.load_state_dict(ema_state)
 
     return model, config, ema
 
