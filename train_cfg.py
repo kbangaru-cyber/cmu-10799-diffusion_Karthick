@@ -97,16 +97,35 @@ def save_checkpoint(path, model, optimizer, ema, scaler, step, config):
     print(f"Saved checkpoint to {path}")
 
 
-def load_checkpoint(path, model, optimizer, ema, scaler, device):
-    ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model"])
-    optimizer.load_state_dict(ckpt["optimizer"])
-    scaler.load_state_dict(ckpt.get("scaler", {}))
-    if ema is not None and "ema" in ckpt:
-        ema.load_state_dict(ckpt["ema"])
-    step = int(ckpt.get("step", 0))
-    print(f"Loaded checkpoint from {path} at step {step}")
-    return step
+def load_checkpoint(checkpoint_path, device):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    config = checkpoint["config"]
+
+    model = create_cond_model_from_config(config).to(device)
+    
+    # Fix for torch.compile: strip "_orig_mod." prefix from state dict keys
+    state_dict = checkpoint["model"]
+    cleaned = {}
+    for k, v in state_dict.items():
+        new_key = k.replace("_orig_mod.", "")
+        cleaned[new_key] = v
+    
+    model.load_state_dict(cleaned, strict=True)
+
+    ema = None
+    if "ema" in checkpoint:
+        decay = (config.get("training", {}) or {}).get("ema_decay", 0.9999)
+        ema = EMA(model, decay=decay)
+        # Also strip prefix from EMA shadow keys
+        ema_state = checkpoint["ema"]
+        if "shadow" in ema_state:
+            ema_state["shadow"] = {
+                k.replace("_orig_mod.", ""): v 
+                for k, v in ema_state["shadow"].items()
+            }
+        ema.load_state_dict(ema_state)
+
+    return model, config, ema
 
 
 @torch.no_grad()
