@@ -84,17 +84,25 @@ def setup_logging(config: dict, method_name: str) -> tuple:
 
 
 def save_checkpoint(path, model, optimizer, ema, scaler, step, config):
+    # Unwrap torch.compile wrapper if present
+    raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
     state = {
-        "model": model.state_dict(),
+        "model": raw_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
         "step": int(step),
         "config": config,
     }
     if ema is not None:
-        state["ema"] = ema.state_dict()
+        ema_state = ema.state_dict()
+        # Also clean EMA shadow keys
+        if 'shadow' in ema_state:
+            ema_state['shadow'] = {
+                k.replace("_orig_mod.", ""): v
+                for k, v in ema_state['shadow'].items()
+            }
+        state["ema"] = ema_state
     torch.save(state, path)
-    print(f"Saved checkpoint to {path}")
 
 
 def load_checkpoint(path, model, optimizer, ema, scaler, device):
